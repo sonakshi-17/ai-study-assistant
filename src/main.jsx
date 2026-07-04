@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import "./styles.css";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8010/api";
+const API_URL = import.meta.env.VITE_API_URL || "/api";
 
 function StatCard({ label, value }) {
   return (

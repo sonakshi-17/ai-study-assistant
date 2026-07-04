@@ -1,0 +1,13 @@
+.env
+.git
+.agents
+.codex
+.vercel
+node_modules
+dist
+__pycache__
+*.db
+*.pdf
+preview.png
+stage1.py
+

@@ -22,8 +22,11 @@ from pydantic import BaseModel, EmailStr, Field
 load_dotenv()
 
 APP_SECRET = os.getenv("APP_SECRET", "change-this-secret-before-production")
-DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "study_assistant.db"))
-MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(15 * 1024 * 1024)))
+DEFAULT_DATABASE_PATH = "/tmp/study_assistant.db" if os.getenv("VERCEL") else "study_assistant.db"
+DATABASE_PATH = Path(os.getenv("DATABASE_PATH", DEFAULT_DATABASE_PATH))
+POSTGRES_URL = os.getenv("POSTGRES_URL") or os.getenv("DATABASE_URL")
+DEFAULT_MAX_UPLOAD_BYTES = 4 * 1024 * 1024 if os.getenv("VERCEL") else 15 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(DEFAULT_MAX_UPLOAD_BYTES)))
 TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", str(7 * 24 * 60 * 60)))
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
@@ -65,18 +68,55 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
+class DatabaseConnection:
+    def __init__(self):
+        if POSTGRES_URL:
+            import psycopg
+            from psycopg.rows import dict_row
+
+            self.connection = psycopg.connect(POSTGRES_URL, row_factory=dict_row)
+            self.is_postgres = True
+        else:
+            self.connection = sqlite3.connect(DATABASE_PATH)
+            self.connection.row_factory = sqlite3.Row
+            self.is_postgres = False
+
+    def execute(self, query, params=()):
+        return self.connection.execute(query.replace("?", "%s") if self.is_postgres else query, params)
+
+    def executemany(self, query, params):
+        return self.connection.executemany(query.replace("?", "%s") if self.is_postgres else query, params)
+
+    def executescript(self, script):
+        if not self.is_postgres:
+            return self.connection.executescript(script)
+        for statement in script.split(";"):
+            if statement.strip():
+                self.connection.execute(statement)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is None:
+            self.connection.commit()
+        else:
+            self.connection.rollback()
+        self.connection.close()
+
+
 def get_db():
-    conn = sqlite3.connect(DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return DatabaseConnection()
 
 
 def init_db():
     with get_db() as conn:
+        id_column = "BIGSERIAL PRIMARY KEY" if POSTGRES_URL else "INTEGER PRIMARY KEY AUTOINCREMENT"
+        foreign_id = "BIGINT" if POSTGRES_URL else "INTEGER"
         conn.executescript(
-            """
+            f"""
             CREATE TABLE IF NOT EXISTS users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id {id_column},
                 name TEXT NOT NULL,
                 email TEXT NOT NULL UNIQUE,
                 password_hash TEXT NOT NULL,
@@ -84,8 +124,8 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS documents (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
+                id {id_column},
+                user_id {foreign_id} NOT NULL,
                 filename TEXT NOT NULL,
                 pages INTEGER NOT NULL,
                 chunks INTEGER NOT NULL,
@@ -95,8 +135,8 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS document_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER NOT NULL,
+                id {id_column},
+                document_id {foreign_id} NOT NULL,
                 page_number INTEGER NOT NULL,
                 chunk_index INTEGER NOT NULL,
                 content TEXT NOT NULL,
@@ -104,9 +144,9 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS chats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                document_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
+                id {id_column},
+                document_id {foreign_id} NOT NULL,
+                user_id {foreign_id} NOT NULL,
                 question TEXT NOT NULL,
                 answer TEXT NOT NULL,
                 citations TEXT NOT NULL,
@@ -289,14 +329,18 @@ def register(request: AuthRequest):
                 """
                 INSERT INTO users (name, email, password_hash, created_at)
                 VALUES (?, ?, ?, ?)
+                RETURNING id
                 """,
                 (name, request.email.lower(), hash_password(request.password), utc_now()),
             )
+            user_id = cursor.fetchone()["id"]
             user = conn.execute(
                 "SELECT id, name, email, created_at FROM users WHERE id = ?",
-                (cursor.lastrowid,),
+                (user_id,),
             ).fetchone()
-        except sqlite3.IntegrityError as exc:
+        except Exception as exc:
+            if "unique" not in str(exc).lower() and "duplicate" not in str(exc).lower():
+                raise
             raise HTTPException(status_code=409, detail="An account with this email already exists.") from exc
 
     return public_user(dict(user), create_token(user))
@@ -367,10 +411,11 @@ async def upload_document(file: UploadFile = File(...), user=Depends(current_use
                 """
                 INSERT INTO documents (user_id, filename, pages, chunks, characters, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
+                RETURNING id
                 """,
                 (user["id"], file.filename, len(pages), len(chunk_records), total_characters, utc_now()),
             )
-            document_id = cursor.lastrowid
+            document_id = cursor.fetchone()["id"]
             conn.executemany(
                 """
                 INSERT INTO document_chunks (document_id, page_number, chunk_index, content)
@@ -438,13 +483,16 @@ def ask_document(document_id: int, request: QuestionRequest, user=Depends(curren
             """
             INSERT INTO chats (document_id, user_id, question, answer, citations, created_at)
             VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
             """,
             (document_id, user["id"], question, answer, json.dumps(citations), utc_now()),
         )
 
+        chat_id = cursor.fetchone()["id"]
+
     return {
         "chat": {
-            "id": cursor.lastrowid,
+            "id": chat_id,
             "question": question,
             "answer": answer,
             "citations": citations,

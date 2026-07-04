@@ -6,3 +6,4 @@ python-dotenv
 groq
 pydantic
 email-validator
+psycopg[binary]
